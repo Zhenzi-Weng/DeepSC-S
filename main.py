@@ -3,372 +3,263 @@ Created on Tue Jun 23 23:41:39 2020
 
 @author: Zhenzi Weng
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
+import os
 import time
-import sys
-import tensorflow as tf
-import librosa
 import argparse
+import tensorflow as tf
 import numpy as np
 import scipy.io as sio
-import os
-from tensorflow.contrib.layers import batch_norm
-from tensorflow.contrib.framework import arg_scope
-from speech_frame import enframe
-from speech_frame import deframe
-from file_path import path_dir
-from SE_model import SE_ResNeXt
-from random import choice
+from models import sem_enc_model, chan_enc_model, Chan_Model, chan_dec_model, sem_dec_model
 
+num_cpus = os.cpu_count()
+print("Number of CPU cores is", num_cpus)
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 gpus = tf.config.experimental.list_physical_devices(device_type="GPU")
 for gpu in gpus:
     tf.config.experimental.set_memory_growth(gpu, True) # assign GPU memory dynamically
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-# recoring print content
-class Logger(object):
-    def __init__(self, fileN="record.txt"):
-        self.terminal = sys.stdout
-        self.log = open(fileN, "w")
- 
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.flush()                 
-    def flush(self):
-        self.log.flush()
- 
-sys.stdout = Logger("./training_record.txt")
-
-
-""" define global parameters """
+###############    define global parameters    ###############
 def parse_args():
     parser = argparse.ArgumentParser(description="semantic communication systems for speech transmission")
     
-    # parameter for mel spectrogram
+    # parameter of frame
     parser.add_argument("--sr", type=int, default=8000, help="sample rate for wav file")
-    parser.add_argument("--num_frames", type=int, default=128, help="number of frame in each barch")
-    parser.add_argument("--frame_length", type=float, default=0.016, help="the time duration of frame")
-    parser.add_argument("--frame_shift", type=float, default=0.016, help="the time duration of frame shift") 
-
-    # channel number and bit number
-    parser.add_argument("--bit_num", type=int, default=512, help="number of bits")
-    parser.add_argument("--channel_num", type=int, default=512, help="number of channel uses")
-
-    # learning rate
-    parser.add_argument("--learning_rate", type=float, default=1e-3, help="learning_rate for training")
+    parser.add_argument("--num_frame", type=int, default=128, help="number of frames in each batch")
+    parser.add_argument("--frame_size", type=float, default=0.016, help="time duration of each frame")
+    parser.add_argument("--stride_size", type=float, default=0.016, help="time duration of frame stride")
     
-    # EbN0 set
-    parser.add_argument("--snr_train_db", type=float, default=8, help="snr for training")
+    # parameter of semantic coding and channel coding
+    parser.add_argument("--sem_enc_outdims", type=list, default=[32, 128, 128, 128, 128, 128, 128],
+                        help="output dimension of SE-ResNet in semantic encoder.")
+    parser.add_argument("--chan_enc_filters", type=list, default=[128],
+                        help="filters of CNN in channel encoder.")
+    parser.add_argument("--chan_dec_filters", type=list, default=[128],
+                        help="filters of CNN in channel decoder.")
+    parser.add_argument("--sem_dec_outdims", type=list, default=[128, 128, 128, 128, 128, 128, 32],
+                        help="output dimension of SE-ResNet in semantic decoder.")
+    
+    # path of tfrecords files
+    parser.add_argument("--trainset_tfrecords_path", type=str, default="path of your trainset.tfrecords",
+                        help="tfrecords path of trainset.")
+    parser.add_argument("--validset_tfrecords_path", type=str, default="path of your validset.tfrecords",
+                        help="tfrecords path of validset.")
+    
+    # parameter of wireless channel
+    parser.add_argument("--snr_train_dB", type=int, default=8, help="snr in dB for training.")
+    
+    # epoch and learning rate
+    parser.add_argument("--num_epochs", type=int, default=1000, help="training epochs.")
+    parser.add_argument("--batch_size", type=int, default=32, help="batch size.")
+    parser.add_argument("--lr", type=float, default=5e-4, help="learning rate.")
     
     args = parser.parse_args()
     
     return args
 
 args = parse_args()
-print("Called with args:")
-print(args)
+print("Called with args:", args)
 
+frame_length = int(args.sr*args.frame_size)
+stride_length = int(args.sr*args.stride_size)
 
-path_training_set = "./dataset/clean_trainset/"
-print(path_training_set)
-
-
-# index the wav file for each iteration
-fname = os.listdir(path_training_set)
-fname = [x for x in fname if x.endswith(".wav")]
-num_training_examples = len(fname)
-
-batch_size = 8
-num_epochs = 400
-num_batches_per_epoch = int( num_training_examples / batch_size )
-
-length = int(args.sr * args.frame_length)
-shift = int(args.sr * args.frame_shift)
-len_one = args.num_frames * shift + length - shift
-
-bits_per_symbol = 6
-rate = 1 / 3
-PCM_bits = 8
-L_total = 512
-chan_filters = int ( 2 * PCM_bits / rate / bits_per_symbol )
-
-assert args.num_frames*length*chan_filters//2 % L_total == 0, "check the size of frames_input"
-
-
-
-def W_size():
-    size = np.zeros(2, dtype=int)
-    size[0] = 5
-    size[1] = 5
-
-    return size
-
-
-def Batch_Normalization(inputs, training, scope):
-    # batch normalization
-    with arg_scope([batch_norm],
-                   scope=scope,
-                   updates_collections=None,
-                   decay=0.9,
-                   center=True,
-                   scale=True,
-                   zero_debias_moving_mean=True) :
-        return tf.cond(training,
-                       lambda : batch_norm(inputs=inputs, is_training=training, reuse=None),
-                       lambda : batch_norm(inputs=inputs, is_training=training, reuse=True))
-
-
-def forw_conv(inputs, kernel, stride, filters, is_train, layer_name):
-    # convolution
-    with tf.name_scope(layer_name + "_conv"):
-        kernel_initializer = tf.contrib.layers.variance_scaling_initializer()
-        bias_initializer = tf.constant_initializer(value=0.0)
+if __name__ == "__main__":
+    
+    ###############    define system model    ###############
+    # define semantic encoder
+    sem_enc = sem_enc_model(frame_length, stride_length, args)
+    print(sem_enc.summary(line_length=160))
+    
+    # define channel encoder
+    chan_enc = chan_enc_model(frame_length, args)
+    print(chan_enc.summary(line_length=160))
+    
+    # define channel model
+    chan_layer = Chan_Model(name="Channel_Model")
+    
+    # define channel decoder
+    chan_dec = chan_dec_model(frame_length, args)
+    print(chan_dec.summary(line_length=160))
+    
+    # define semantic decoder
+    sem_dec = sem_dec_model(frame_length, stride_length, args)
+    print(sem_dec.summary(line_length=160))
+    
+    # all trainable weights
+    weights_all = sem_enc.trainable_weights + chan_enc.trainable_weights +\
+                  chan_dec.trainable_weights + sem_dec.trainable_weights
+    
+    # define MSE loss function
+    mse_loss = tf.keras.losses.MeanSquaredError(name="mse_loss")
+    
+    # define optimizer
+    optimizer = tf.keras.optimizers.RMSprop(learning_rate=args.lr)
+    
+    ###############    define train step and valid step    ###############
+    @tf.function
+    def train_step(_input, std):
         
-        conv = tf.keras.layers.Conv2D(filters=filters, kernel_size=kernel, strides=stride,
-                                      kernel_initializer=kernel_initializer, 
-                                      bias_initializer = bias_initializer,
-                                      padding="SAME")(inputs)
+        std = tf.cast(std, dtype=tf.float32)
+        with tf.GradientTape() as tape:
+            _output, batch_mean, batch_var = sem_enc(_input)
+            _output = chan_enc(_output)
+            _output = chan_layer(_output, std)
+            _output = chan_dec(_output)
+            _output = sem_dec([_output, batch_mean, batch_var])
+            loss_value = mse_loss(_input, _output)
         
-    # batch normalization
-    conv_BN = Batch_Normalization(conv, training = is_train, scope = layer_name + "_BN")
+        grads = tape.gradient(loss_value, weights_all)  # compute gradients
+        optimizer.apply_gradients(zip(grads, weights_all))  # update parameters
+
+        return loss_value
+    
+    @tf.function
+    def valid_step(_input, std):
         
-    return conv_BN
+        std = tf.cast(std, dtype=tf.float32)
+        _output, batch_mean, batch_var = sem_enc(_input)
+        _output = chan_enc(_output)
+        _output = chan_layer(_output, std)
+        _output = chan_dec(_output)
+        _output = sem_dec([_output, batch_mean, batch_var])
+        loss_value = mse_loss(_input, _output)
 
+        return loss_value
 
-def encoder(frames_input, is_train):
-    
-    # source coding
-    source_input = tf.reshape(frames_input, [tf.shape(frames_input)[0], args.num_frames, length, 1])
-    with tf.compat.v1.variable_scope("enc_s1"): 
-        s1 = SE_ResNeXt(source_input, filters = 32, out_dim = 32, is_train = is_train, name = "enc_s1", blocks = 6).model
-      
-    # channel coding
-    with tf.compat.v1.variable_scope("enc_c1"):               
-        c1 = forw_conv(s1, [W_size()[0], W_size()[1]], [1, 1], chan_filters, is_train=is_train, layer_name = "enc_c1")
-    
-    # reshape layer
-    x = tf.reshape(c1, [tf.shape(c1)[0], args.num_frames*length*chan_filters // L_total // 2, L_total, 2], name = "x")
-    
-    # normalize the average power of each dim in x into 0.5
-    x_norm = tf.scalar_mul(tf.sqrt(tf.cast(tf.shape(x)[2] / 2, tf.float32)), tf.nn.l2_normalize(x, axis=2))
-    x_norm = tf.identity(x_norm, name = "x_norm")
-    
-    return x_norm
+    ###############    map function to read tfrecords    ###############
+    @tf.function
+    def map_function(example):
 
+        feature_map = {"wav_raw": tf.io.FixedLenFeature([], tf.string)}
+        parsed_example = tf.io.parse_single_example(example, features=feature_map)
+    
+        wav_slice = tf.io.decode_raw(parsed_example["wav_raw"], out_type=tf.int16)
+        wav_slice = tf.cast(wav_slice, tf.float32) / 2**15
 
-# channel layer 
-def channel_layer(x, std):
-    x_real = x[:, :, :, 0]
-    x_imag = x[:, :, :, 1]
-    x_complex = tf.complex( real=x_real, imag=x_imag )
+        return wav_slice
     
-    # channel
-    h_real = tf.divide( tf.random.normal(shape=[tf.shape(x_complex)[0], args.num_frames*length*chan_filters // L_total // 2, 1], dtype=tf.float32),
-                        tf.sqrt(2.) )
-    h_imag = tf.divide( tf.random.normal(shape=[tf.shape(x_complex)[0], args.num_frames*length*chan_filters // L_total // 2, 1], dtype=tf.float32),
-                        tf.sqrt(2.) )
-    h_real = tf.add( tf.sqrt(3. / 4.), tf.multiply(tf.sqrt(1. / 4.), h_real) )
-    h_imag = tf.add( tf.sqrt(3. / 4.), tf.multiply(tf.sqrt(1. / 4.), h_imag) )
+    ###################    create folder to save data    ###################
+    common_dir = "path to save the trained data"
+    saved_model = common_dir + "saved_model/"
     
-    h_complex = tf.complex( real=h_real, imag=h_imag )
+    # create files to save train loss
+    train_loss_dir = common_dir + "train/"   
+    os.makedirs(train_loss_dir)
+    train_loss_file = train_loss_dir + "train_loss.mat"
+    train_loss_all = []
     
-    # noise
-    noise = tf.complex(
-        real = tf.random.normal(shape=tf.shape(x_complex), mean=0.0, stddev=std, dtype=tf.float32),
-        imag = tf.random.normal(shape=tf.shape(x_complex), mean=0.0, stddev=std, dtype=tf.float32))
+    # create files to save eval loss
+    valid_loss_dir = common_dir + "valid/"   
+    os.makedirs(valid_loss_dir)
+    valid_loss_file = valid_loss_dir + "valid_loss.mat"
+    valid_loss_all = []
     
-    # received signal y
-    hx = tf.multiply( h_complex, x_complex )
-    r_complex = tf.add( hx, noise )
-     
-    # perfect channel estimation
-    y_complex = tf.divide( r_complex, h_complex )
-    y_real = tf.reshape( tf.math.real(y_complex), [tf.shape(y_complex)[0], args.num_frames*length*chan_filters // L_total // 2, L_total, 1] )
-    y_imag = tf.reshape( tf.math.imag(y_complex), [tf.shape(y_complex)[0], args.num_frames*length*chan_filters // L_total // 2, L_total, 1] )
-    y = tf.concat( [y_real, y_imag], -1, name = "y" )
-    
-    return y
-
-
-def decoder(y, is_train):
-    # reshape layer
-    channel_input = tf.reshape(y, [tf.shape(y)[0], args.num_frames, length, chan_filters])
-    
-    # channel decoding
-    with tf.compat.v1.variable_scope("dec_c1"):               
-        c1 = forw_conv(channel_input, [W_size()[0], W_size()[1]], [1, 1], chan_filters, is_train=is_train, layer_name = "dec_c1")
-        c1 = tf.nn.relu(c1)
+    print("*****************   start train   *****************")
+    snr = pow(10, (args.snr_train_dB / 10))
+    std = np.sqrt(1 / (2*snr))
+    for epoch in range(args.num_epochs):
+        ##########################    train    ##########################
+        # read .tfrecords file
+        trainset = tf.data.TFRecordDataset(args.trainset_tfrecords_path)
+        trainset = trainset.map(map_func=map_function, num_parallel_calls=num_cpus) # num_parallel_calls should be number of cpu cores
+        trainset = trainset.shuffle(buffer_size=args.batch_size*657, reshuffle_each_iteration=True)
+        trainset = trainset.batch(batch_size=args.batch_size)
+        trainset = trainset.prefetch(buffer_size=args.batch_size)
         
-    # source decoding
-    with tf.compat.v1.variable_scope("dec_s1"): 
-        s1 = SE_ResNeXt(c1, filters = 32, out_dim = 32, is_train = is_train, name = "dec_s1", blocks = 6).model
+        # train_loss for each epoch
+        train_loss_epoch = []
+        train_loss = 0.0
         
-    with tf.compat.v1.variable_scope("dec_s2"):               
-        s2 = forw_conv(s1, [W_size()[0], W_size()[1]], [1, 1], 1, is_train=is_train, layer_name = "dec_s2")   
-     
-    frames_output = tf.reshape(s2, [tf.shape(s2)[0], args.num_frames, length], name = "frames_output") 
-    
-    return frames_output
-    
-
-def train_optim(loss, lr):
-    
-    with tf.control_dependencies(tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.UPDATE_OPS)):
-        """optimizer"""
-        optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate=lr, beta1=0.9, beta2=0.99, epsilon=1e-8)
-        auto_solver = optimizer.minimize(loss)
-    
-    return auto_solver
-
-
-def norm(frames): 
-    # mean and var
-    batch_mean, batch_var = tf.nn.moments(frames, [1, 2])
-    mean = tf.tile(tf.reshape(batch_mean, [tf.shape(batch_mean)[0], 1, 1]), [1, args.num_frames, length]) 
-    var = tf.tile(tf.reshape(batch_var, [tf.shape(batch_var)[0], 1, 1]), [1, args.num_frames, length])
-    
-    frames_norm = tf.divide(tf.subtract(frames, mean), tf.sqrt(var), name = "frames_norm")
-    
-    return frames_norm, mean, var
-
-
-def denorm(frames, mean, var): 
-    
-    frames_denorm = tf.add(tf.multiply(frames, tf.sqrt(var)), mean, name = "frames_denorm")
-    
-    return frames_denorm
-
-
-def wav_generator(data_path):    
-    
-    wav_all = np.zeros(shape=[batch_size, len_one])
-    
-    ind = 0
-    
-    while ind < batch_size:
-        
-        current_file_path = path_dir(data_path)
-        wav_signal, _ = librosa.load(current_file_path, sr = args.sr)
-         
-        if len(wav_signal) <= len_one:      
-            while len(wav_signal) <= len_one:
-                wav_signal = np.concatenate((wav_signal, wav_signal), axis = 0)
-            wav_all[ind] = wav_signal[0 : len_one]
-            ind += 1
-            
-        else:
-            parts = len(wav_signal) // len_one + 1 
-            wav_signal = np.concatenate( (wav_signal, wav_signal), axis = 0 )
-            start_ind = choice( np.arange(parts) )
-            num_mb = np.min( [parts - start_ind, batch_size - ind] )
-            wav_t = wav_signal[start_ind * len_one : (start_ind + num_mb) * len_one]
-            wav_all[ ind:ind + num_mb ] = np.reshape( wav_t, [num_mb, len_one] )           
-            ind += num_mb
-        
-    return wav_all
-
-
-""" start main function"""
-print("start main function")
-wav_input = tf.compat.v1.placeholder(tf.float32, shape=[None, len_one], name="wav_input")
-noise_std = tf.compat.v1.placeholder(tf.float32, shape=[], name = "std") 
-lr = tf.compat.v1.placeholder(tf.float32, shape=[], name = "learning_rate") 
-is_train = tf.compat.v1.placeholder_with_default(False, shape =[], name = "is_train")
-
-
-# frame_input
-frames_input = enframe(wav_input, length, shift, args.num_frames)
-
-# frames norm
-frames_norm, mean, var = norm(frames_input)
-
-# autoencoder
-x = encoder(frames_norm, is_train)
-y = channel_layer(x, noise_std)
-frames_output = decoder(y, is_train)
-
-# frames_denorm
-frames_denorm = denorm(frames_output, mean, var)
-wav_output = deframe(frames_denorm, length, shift, args.num_frames)
-
-# loss computation
-loss = tf.compat.v1.losses.mean_squared_error(wav_input, wav_output, scope = "loss")
-
-# 
-print(wav_input)
-print(frames_input)
-print(frames_norm)
-print(x)
-print(y)
-print(frames_output)
-print(frames_denorm)
-print(wav_output)
-print(loss)
-
-
-# Optimizer
-auto_solver = train_optim(loss, lr)
-
-
-# initialization
-config = tf.compat.v1.ConfigProto()
-config.gpu_options.allow_growth = True
-saver = tf.compat.v1.train.Saver()
-
-# parameters
-R = args.bit_num/args.channel_num
-snr_train = pow(10, (args.snr_train_db/10))
-std_train = np.sqrt(1 / (2 * R * snr_train))
-
-# training stage
-with tf.compat.v1.Session(config=config) as sess:
-    # initialization of NN parameters
-    sess.run(tf.compat.v1.global_variables_initializer())
-    
-    # create a files to save the network
-    common_dir = "./" + "saved_data/"
-    os.makedirs(common_dir + "saved_network/") 
-    trained_network = common_dir + "saved_network/" + "trained_net.ckpt"
-
-    # create a mat files to save the training loss 
-    os.makedirs(common_dir + "/loss")   
-    training_loss_all = common_dir + "/loss/" + "training_loss" + ".mat"    
-    save_training_loss_all = {}
-    training_loss = np.zeros([num_batches_per_epoch, num_epochs], dtype = float)
-    
-    # start training 
-    epoch_lr = args.learning_rate
-    
-    for epo in range(num_epochs):
-        train_loss = 0
+        # record the train time for each epoch
         start = time.time()
         
-        # index the wav file for each epochs
-        for batch in range(num_batches_per_epoch):
+        for step, _input in enumerate(trainset):
+            # train step
+            loss_value = train_step(_input, std)
+            loss_float = float(loss_value)
+            train_loss_epoch.append(loss_float)
             
-            data_path = path_training_set  
-            wav_all = wav_generator(data_path)               
-            batch_loss, _ = sess.run([loss, auto_solver], feed_dict={wav_input: wav_all, 
-                                                                     noise_std: std_train,
-                                                                     lr: epoch_lr,
-                                                                     is_train: True})
-             
-            training_loss[batch, epo] = batch_loss
-            train_loss += batch_loss * batch_size                 
+            # Calculate the accumulated train loss value
+            train_loss += loss_float
+            
+        # average train loss for each epoch
+        train_loss /= (step + 1)
+        # append one epoch loss value
+        train_loss_all.append(np.array(train_loss_epoch, dtype=np.float32))
         
-        train_loss /= batch_size * num_batches_per_epoch
+        # print log
+        log = "train epoch {}/{}, train_loss = {:.06f}, time = {:.06f}"
+        print(log.format(epoch + 1, args.num_epochs, train_loss, time.time() - start))
         
-        print("epochs:", epo + 1, "train loss:", train_loss, "time:", time.time() - start)
+        ##########################    valid    ##########################
+        # read .tfrecords file
+        validset = tf.data.TFRecordDataset(args.validset_tfrecords_path)
+        validset = validset.map(map_func=map_function, num_parallel_calls=num_cpus)
+        validset = validset.batch(batch_size=args.batch_size)
+        validset = validset.prefetch(buffer_size=args.batch_size)
+        
+        # valid_loss for each epoch
+        valid_loss_epoch = []
+        valid_loss = 0.0
             
-             
-    # save the network
-    saver_path = saver.save(sess, trained_network)  
-    print("saved meta network:", saver_path)
+        # record the valid time for each epoch
+        start = time.time()
+        
+        for step, _input in enumerate(validset):
+            # valid step
+            loss_value = valid_step(_input, std)
+            loss_float = float(loss_value)
+            valid_loss_epoch.append(loss_float)
             
-    # save loss_all    
-    save_training_loss_all["training_loss"] = training_loss
-    sio.savemat(training_loss_all, save_training_loss_all)
-    
-    
+            # Calculate the accumulated valid loss value
+            valid_loss += loss_float
+        
+        # average valid loss for each epoch
+        valid_loss /= (step + 1)
+        # append one epoch loss value
+        valid_loss_all.append(np.array(valid_loss_epoch, dtype=np.float32))
+        
+        # print log
+        log = "valid epoch {}/{}, valid_loss = {:.06f}, time = {:.06f}"
+        print(log.format(epoch + 1, args.num_epochs, valid_loss, time.time() - start))
+        print()
+        
+        ###################    save the train network    ###################
+        if (epoch + 1) % 1000 == 0:
+            saved_model_dir = os.path.join(saved_model, "{}_epochs".format(epoch + 1))
+            os.makedirs(saved_model_dir)
+            
+            # semantic_encoder
+            sem_enc_h5 = saved_model_dir + "/sem_enc.h5"
+            sem_enc.save(sem_enc_h5)
+            
+            # channel_encoder
+            chan_enc_h5 = saved_model_dir + "/chan_enc.h5"
+            chan_enc.save(chan_enc_h5)
+            
+            # channel_decoder
+            chan_dec_h5 = saved_model_dir + "/chan_dec.h5"
+            chan_dec.save(chan_dec_h5)
+            
+            # semantic_decoder
+            sem_dec_h5 = saved_model_dir + "/sem_dec.h5"
+            sem_dec.save(sem_dec_h5)
+            
+            ################    save train loss and valid loss    ################
+            if os.path.exists(train_loss_file):
+                os.remove(train_loss_file)
+            save_train_loss = {}
+            train_loss_save = np.array(train_loss_all, dtype=np.float32)
+            save_train_loss["train_loss"] = train_loss_save
+            sio.savemat(train_loss_file, save_train_loss)
+            
+            if os.path.exists(valid_loss_file):
+                os.remove(valid_loss_file)
+            save_valid_loss = {}
+            valid_loss_save = np.array(valid_loss_all, dtype=np.float32)
+            save_valid_loss["valid_loss"] = valid_loss_save
+            sio.savemat(valid_loss_file, save_valid_loss)
